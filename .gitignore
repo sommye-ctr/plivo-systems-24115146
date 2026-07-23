@@ -1,0 +1,8 @@
+env/
+.python-version
+systems_handout/__pycache__/
+.DS_Store
+systems_handout/sender
+systems_handout/receiver
+systems_handout/playout_log.json
+systems_handout/relay_stats.json
