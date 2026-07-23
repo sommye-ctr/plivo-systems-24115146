@@ -8,6 +8,8 @@
 #include <cstdlib>
 #include <cstring>
 
+static const uint32_t K = 2; // block size: K data frames share 1 XOR parity frame
+
 int main(void)
 {
     int in_fd = socket(AF_INET, SOCK_DGRAM, 0);
@@ -36,9 +38,9 @@ int main(void)
     relay_addr.sin_port = htons(47001);
     relay_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    uint8_t payload_history[8][160];
     uint8_t recv_buf[2048];
-    uint8_t send_buf[324];
+    uint8_t send_buf[164];
+    uint8_t block_xor[160] = {0};
 
     for (;;)
     {
@@ -49,31 +51,34 @@ int main(void)
         uint32_t net_seq;
         std::memcpy(&net_seq, recv_buf, 4);
         uint32_t seq = ntohl(net_seq);
+        const uint8_t *payload = recv_buf + 4;
 
-        std::memcpy(payload_history[seq % 8], recv_buf + 4, 160);
-
-        // FEC Parity P_N = Payload(N) XOR Payload(N-1) for N >= 1, skipping 1 in 35 to stay strictly under 2.0x overhead
-        bool send_fec = (seq > 0) && (seq % 35 != 0);
-
-        uint32_t wire_seq = htonl(seq | (send_fec ? 0x80000000U : 0U));
+        // Data packet: 4B header (bit31=0, seq) + 160B primary payload.
+        uint32_t wire_seq = htonl(seq);
         std::memcpy(send_buf, &wire_seq, 4);
-        std::memcpy(send_buf + 4, recv_buf + 4, 160);
+        std::memcpy(send_buf + 4, payload, 160);
+        sendto(out_fd, send_buf, 164, 0, (struct sockaddr *)&relay_addr, sizeof(relay_addr));
 
-        size_t total_len = 164;
-        if (send_fec)
+        uint32_t idx_in_block = seq % K;
+        if (idx_in_block == 0)
         {
-            uint32_t prev_seq = seq - 1;
-            const uint8_t *curr_p = recv_buf + 4;
-            const uint8_t *prev_p = payload_history[prev_seq % 8];
-            uint8_t *fec_p = send_buf + 164;
+            std::memcpy(block_xor, payload, 160);
+        }
+        else
+        {
             for (size_t k = 0; k < 160; ++k)
-            {
-                fec_p[k] = curr_p[k] ^ prev_p[k];
-            }
-            total_len += 160;
+                block_xor[k] ^= payload[k];
         }
 
-        sendto(out_fd, send_buf, total_len, 0, (struct sockaddr *)&relay_addr, sizeof(relay_addr));
+        if (idx_in_block == K - 1)
+        {
+            // Block complete: send parity packet (bit31=1, block_id) + XOR payload.
+            uint32_t block_id = seq / K;
+            uint32_t wire_block = htonl(block_id | 0x80000000U);
+            std::memcpy(send_buf, &wire_block, 4);
+            std::memcpy(send_buf + 4, block_xor, 160);
+            sendto(out_fd, send_buf, 164, 0, (struct sockaddr *)&relay_addr, sizeof(relay_addr));
+        }
     }
 
     close(in_fd);
