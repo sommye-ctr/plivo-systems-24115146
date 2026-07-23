@@ -20,12 +20,16 @@ int main(void)
     in_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
     if (bind(in_fd, (struct sockaddr *)&in_addr, sizeof(in_addr)) < 0)
     {
+        close(in_fd);
         return 1;
     }
 
     int out_fd = socket(AF_INET, SOCK_DGRAM, 0);
     if (out_fd < 0)
+    {
+        close(in_fd);
         return 1;
+    }
 
     struct sockaddr_in relay_addr = {0};
     relay_addr.sin_family = AF_INET;
@@ -34,7 +38,7 @@ int main(void)
 
     uint8_t payload_history[8][160];
     uint8_t recv_buf[2048];
-    uint8_t send_buf[325];
+    uint8_t send_buf[324];
 
     for (;;)
     {
@@ -48,18 +52,24 @@ int main(void)
 
         std::memcpy(payload_history[seq % 8], recv_buf + 4, 160);
 
-        bool send_redundant = (seq >= 3) && (seq % 4 != 0);
+        // FEC Parity P_N = Payload(N) XOR Payload(N-1) for N >= 1, skipping 1 in 35 to stay strictly under 2.0x overhead
+        bool send_fec = (seq > 0) && (seq % 35 != 0);
 
-        uint32_t wire_seq = htonl(seq);
+        uint32_t wire_seq = htonl(seq | (send_fec ? 0x80000000U : 0U));
         std::memcpy(send_buf, &wire_seq, 4);
-        send_buf[4] = send_redundant ? 1 : 0;
-        std::memcpy(send_buf + 5, recv_buf + 4, 160);
+        std::memcpy(send_buf + 4, recv_buf + 4, 160);
 
-        size_t total_len = 165;
-        if (send_redundant)
+        size_t total_len = 164;
+        if (send_fec)
         {
-            uint32_t rseq = seq - 3;
-            std::memcpy(send_buf + 165, payload_history[rseq % 8], 160);
+            uint32_t prev_seq = seq - 1;
+            const uint8_t *curr_p = recv_buf + 4;
+            const uint8_t *prev_p = payload_history[prev_seq % 8];
+            uint8_t *fec_p = send_buf + 164;
+            for (size_t k = 0; k < 160; ++k)
+            {
+                fec_p[k] = curr_p[k] ^ prev_p[k];
+            }
             total_len += 160;
         }
 

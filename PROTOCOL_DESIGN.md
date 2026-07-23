@@ -159,3 +159,13 @@ deduped through the same structure — first arrival wins.
   round trip without threatening the 1% cap — not a primary mechanism.
 - Exact wire header layout (seq + which prior frame's payload is
   attached + payload).
+
+## Submission note
+
+The submission itself asks us to name **one fixed `delay_ms` value** to be
+graded at — not a sweep. Grading profiles are unseen, so this value has to
+be chosen conservatively enough to stay valid across profiles we haven't
+measured, not just tuned to A/B's observed jitter tail. All the sweeps in
+this doc (and in `V1_RESULTS.md`) are exploration to find that number, not
+the deliverable — the deliverable is a single chosen `delay_ms` (plus the
+protocol that makes it valid) that we report at submission time.

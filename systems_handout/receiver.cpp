@@ -51,35 +51,39 @@ int main(void)
         uint8_t buf[2048];
         for (;;) {
             ssize_t n = recvfrom(in_fd, buf, sizeof(buf), 0, NULL, NULL);
-            if (n < 165) continue;
+            if (n < 164) continue;
 
             uint32_t net_seq;
             std::memcpy(&net_seq, buf, 4);
-            uint32_t seq = ntohl(net_seq);
+            uint32_t raw_seq = ntohl(net_seq);
+            bool has_fec = (raw_seq & 0x80000000U) != 0;
+            uint32_t seq = raw_seq & 0x7FFFFFFFU;
 
-            uint8_t flags = buf[4];
-            bool has_redundant = (flags & 0x01) != 0;
-            if (has_redundant && n < 325) continue;
+            if (has_fec && n < 324) continue;
 
             std::lock_guard<std::mutex> lock(ring_mutex);
 
+            // 1. Store primary payload for frame seq
             if (seq >= next_to_play) {
                 size_t idx = seq % capacity;
                 if (!ring[idx].present || ring[idx].seq != seq) {
                     ring[idx].seq = seq;
                     ring[idx].present = true;
-                    std::memcpy(ring[idx].payload, buf + 5, 160);
+                    std::memcpy(ring[idx].payload, buf + 4, 160);
                 }
             }
 
-            if (has_redundant && seq >= 3) {
-                uint32_t rseq = seq - 3;
+            // 2. Reconstruct frame seq - 1 using FEC parity if missing
+            if (has_fec && seq >= 1) {
+                uint32_t rseq = seq - 1;
                 if (rseq >= next_to_play) {
                     size_t ridx = rseq % capacity;
                     if (!ring[ridx].present || ring[ridx].seq != rseq) {
-                        ring[ridx].seq = rseq;
+                        for (size_t k = 0; k < 160; ++k) {
+                            ring[ridx].payload[k] = buf[4 + k] ^ buf[164 + k];
+                        }
                         ring[ridx].present = true;
-                        std::memcpy(ring[ridx].payload, buf + 165, 160);
+                        ring[ridx].seq = rseq;
                     }
                 }
             }
@@ -98,7 +102,8 @@ int main(void)
     player_addr.sin_port = htons(47020);
     player_addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
-    double start_sec = t0 + (delay_ms / 1000.0);
+    // Playout clock target: 10ms before deadline to absorb OS thread sleep scheduling jitter
+    double start_sec = t0 + (delay_ms / 1000.0) - 0.010;
     using Clock = std::chrono::system_clock;
     auto start_tp = Clock::time_point(std::chrono::duration_cast<Clock::duration>(std::chrono::duration<double>(start_sec)));
 
