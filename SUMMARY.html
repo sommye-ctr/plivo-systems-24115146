@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Real-Time UDP Sender/Receiver — Architecture &amp; Design Summary</title>
+<style>
+  :root {
+    --bg: #0f1115; --panel: #171a21; --ink: #e6e8ee; --muted: #9aa3b2;
+    --accent: #5db0ff; --good: #4ec97b; --bad: #ff6b6b; --line: #2a2f3a;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.65 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 48px 24px 96px; }
+  h1 { font-size: 30px; line-height: 1.2; margin: 0 0 6px; }
+  h2 { font-size: 21px; margin: 44px 0 12px; padding-top: 16px; border-top: 1px solid var(--line); }
+  h3 { font-size: 16px; margin: 24px 0 6px; color: var(--accent); }
+  .sub { color: var(--muted); margin: 0 0 8px; }
+  p { margin: 10px 0; }
+  code { font-family: var(--mono); font-size: 0.9em; background: #21262f; padding: 1px 5px; border-radius: 4px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 16px; overflow-x: auto; font-family: var(--mono); font-size: 13px; line-height: 1.5; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 18px 20px; margin: 16px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 14px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.num, th.num { text-align: right; font-family: var(--mono); }
+  .good { color: var(--good); font-weight: 600; }
+  .bad { color: var(--bad); font-weight: 600; }
+  .tag { display: inline-block; font-size: 12px; color: var(--muted); border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; margin-right: 6px; }
+  ul { margin: 10px 0; padding-left: 22px; }
+  li { margin: 6px 0; }
+  .callout { border-left: 3px solid var(--accent); padding: 4px 16px; margin: 16px 0; color: var(--ink); background: #141922; border-radius: 0 8px 8px 0; }
+  .lede { font-size: 17px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <h1>Real-Time UDP Sender/Receiver</h1>
+  <p class="sub">Architecture &amp; design summary — protocol v3 (locked)</p>
+  <p><span class="tag">C++17</span><span class="tag">UDP</span><span class="tag">block-parity FEC (K=2)</span><span class="tag">forward-on-arrival</span><span class="tag">overhead 1.54×</span><span class="tag">grade @ delay_ms=120</span></p>
+
+  <p class="lede">Two C++ programs carry a 20&nbsp;ms voice frame stream across a deliberately hostile
+  UDP relay (drops, jitter, reordering, duplication). The goal: keep the deadline-miss rate
+  under 1%, stay under 2× bandwidth, and add as little playout delay as possible.</p>
+
+  <h2>1. System context &amp; data path</h2>
+  <p>Our code owns only the middle two boxes. The harness source, relay, and player are fixed and
+  unmodifiable; the relay also meters every byte we send for the overhead cap.</p>
+<pre>
+  harness source                                             harness player
+  (emits frame i     ┌─────────┐   hostile   ┌───────────┐   (judges frame i
+   every 20ms)  ───▶ │ SENDER  │ ──relay──▶  │ RECEIVER  │ ─▶ against deadline
+   :47010           │ :47001  │  drop/delay/ │  :47002   │    t0+delay+i·20ms)
+                     └─────────┘  reorder/dup └───────────┘    :47020
+                       our code                 our code
+</pre>
+  <div class="callout">
+    <strong>The scoring insight that shaped the whole design.</strong> The player
+    (<code>endpoints.py</code>) marks frame <code>i</code> present iff <em>any</em> correct-seq
+    packet for it arrives before <code>t0 + delay_ms + i·20ms</code>. It dedups by seq itself and
+    never penalizes early arrival. So the receiver's job is simply to get each correct frame to the
+    player as early as possible — there is nothing to be gained by buffering on our side.
+  </div>
+
+  <h2>2. Wire protocol</h2>
+  <p>One flat packet shape for everything — no variable-length forms to special-case.</p>
+<pre>
+  ┌───────────────── 4 bytes ─────────────────┬──────── 160 bytes ────────┐
+  │ bit 31 = is_parity                         │                           │
+  │ bits 0..30 = seq (data) / block_id (parity)│  payload (opaque, random) │
+  └────────────────────────────────────────────┴───────────────────────────┘
+  164 bytes, big-endian header. Data packet: is_parity=0, carries frame `seq`.
+  Parity packet: is_parity=1, carries XOR of the K frames in `block_id`.
+</pre>
+  <p>Payloads are SHA-256-derived and incompressible, so every redundant byte costs its full 160
+  bytes — there is no compression trick, only how cleverly we spend the byte budget.</p>
+
+  <h2>3. Sender architecture</h2>
+  <p>Single-threaded and stateless beyond one running XOR accumulator. The harness already paces us
+  at 20&nbsp;ms, so we never batch or add delay.</p>
+  <ul>
+    <li>On each frame: forward the data packet immediately (header = <code>seq</code>).</li>
+    <li>Maintain <code>block_xor</code> = XOR of the K=2 frames in the current block; reset it at
+      the block's first frame (<code>seq % K == 0</code>), fold in each subsequent frame.</li>
+    <li>At the last frame of a block (<code>seq % K == K-1</code>): emit one extra parity packet
+      (header = <code>block_id | 0x80000000</code>, payload = <code>block_xor</code>).</li>
+  </ul>
+  <p>Net result: for every K data packets we add exactly one parity packet, so bandwidth is a fixed
+  <code>(K+1)/K × 164/160 = 1.54×</code> — independent of the network, hence identical on any grading
+  profile.</p>
+
+  <h2>4. Receiver architecture</h2>
+  <p>A single receive loop. No playout thread, no clock, no mutex — the simplification is the design.</p>
+
+  <h3>4.1 Forward-on-arrival</h3>
+  <p>Every data frame is forwarded to the player the moment it arrives; every reconstructed frame is
+  forwarded the moment it is rebuilt. Because the player enforces the deadline and dedups, this is
+  both correct and optimal: a frame can only help by arriving <em>earlier</em>. A best-effort seq
+  dedup (<code>sent_seq[seq % window]</code>) avoids duplicate sends and wasted reconstruction work.</p>
+
+  <h3>4.2 Block reconstruction (single-erasure FEC)</h3>
+  <p>Per block we keep a <code>BlockState</code>: a <code>got[K]</code> bitmap, a running
+  <code>partial_xor</code> of the data frames seen, and the parity payload once it arrives. On every
+  arrival we update the block and call <code>try_reconstruct</code>: if the parity is in and exactly
+  <code>K-1</code> of the <code>K</code> data frames are in, the missing frame is
+  <code>partial_xor ⊕ parity</code> — rebuilt and forwarded through the same path as a normal arrival.</p>
+
+  <h3>4.3 Retirement horizon (bounded memory, safe slot reuse)</h3>
+  <p>Blocks live in a ring indexed by <code>block_id % block_capacity</code>. A frame's deadline is a
+  known function of its seq, so once we have seen a seq <code>window</code> ahead, older frames are
+  certainly expired. <code>floor_seq = max_seq_seen − window</code> retires them, so a late or
+  duplicate packet for an expired block can never clobber a slot now reused by a newer block. Memory
+  is bounded to the playout horizon, not the stream length.</p>
+
+  <h2>5. Design choices &amp; trade-offs</h2>
+
+  <h3>FEC, not retransmission</h3>
+  <p>A NACK would have to cross the hostile relay twice (request + resend), each leg paying the full
+  10–80&nbsp;ms delay range and its own loss risk — 20–160&nbsp;ms added to the exact quantity we are
+  scored on. Proactive parity turns "did this frame survive?" into "did the frame <em>and</em> its
+  independently-routed parity both get unlucky?", recovered with zero round trip.</p>
+
+  <h3>Block parity at K=2, not larger K and not full duplication</h3>
+  <p>Recovery latency is ~one frame (20&nbsp;ms): parity for a block is available right after the
+  block's last frame. K=4 (1.28× overhead) recovers too little — a 5%-loss profile too often takes a
+  second hit inside one wide block. Full duplication (~2.0×) leaves no headroom. K=2 is the sweet
+  spot: enough recovery strength for a 5% profile at a comfortable 1.54× with real margin under the cap.</p>
+
+  <h3>No receiver playout clock — the decisive fix</h3>
+  <p>Earlier versions ran a <code>sleep_until</code> jitter buffer that held each frame to ~its
+  deadline before emitting. Since the player only cares about arrival-before-deadline, that buffering
+  bought nothing and its wake-ups were subject to OS scheduling jitter — which made identical-seed
+  runs on profile B straddle the 1% cap (1.07% / 1.00% / 1.00%). Removing it made the same runs stable
+  at 0.60%.</p>
+
+  <h3>Delay budget</h3>
+  <p>The floor is intrinsic to the profile: B's ~80&nbsp;ms jitter tail + ~20&nbsp;ms parity lag ⇒
+  ~100&nbsp;ms. We grade at <strong>120&nbsp;ms</strong> — a deliberate margin over the floor, because
+  grading profiles are unseen and may be harsher than B.</p>
+
+  <h2>6. Measured results (profile B, the binding case)</h2>
+  <table>
+    <thead><tr><th>version</th><th>mechanism</th><th class="num">B lowest valid delay</th><th class="num">overhead</th><th>same-seed stability</th></tr></thead>
+    <tbody>
+      <tr><td>baseline</td><td>forward as-is</td><td class="num">— (5.4% floor)</td><td class="num">1.02×</td><td class="bad">n/a — invalid</td></tr>
+      <tr><td>v1</td><td>piggyback N−3</td><td class="num">— (11%+)</td><td class="num">1.78×</td><td class="bad">n/a — invalid</td></tr>
+      <tr><td>v2</td><td>1-frame XOR + playout clock</td><td class="num">120&nbsp;ms</td><td class="num">1.9963×</td><td class="bad">straddled cap</td></tr>
+      <tr><td><strong>v3</strong></td><td><strong>K=2 block parity + forward-on-arrival</strong></td><td class="num good">~100–110&nbsp;ms</td><td class="num good">1.54×</td><td class="good">stable (0.60–0.93%)</td></tr>
+    </tbody>
+  </table>
+  <p>v3 improves all three graded axes: lower delay (the score), lower overhead (the tiebreaker, with
+  margin), and — most importantly — repeatability, so a graded run cannot lose to an unlucky
+  scheduling slice. Full per-run data in <code>RUNLOG.md</code>.</p>
+
+  <h2>7. Known failure modes</h2>
+  <ul>
+    <li><strong>2-loss bursts within a block.</strong> Single parity recovers one erasure per block;
+      losing both data frames of a block is unrecoverable. Practice profiles A/B are i.i.d. and don't
+      exercise this, but the relay supports Gilbert-Elliott burst loss.</li>
+    <li><strong>Jitter tail beyond the chosen delay.</strong> A frame delayed past
+      <code>t0 + delay_ms + i·20ms</code> is an unavoidable miss regardless of FEC; a profile with a
+      &gt;100&nbsp;ms tail would need a larger <code>delay_ms</code>.</li>
+    <li><strong>Mitigation not taken:</strong> interleaving block members (pairing frames a stride
+      apart) buys burst tolerance but adds ~stride×20&nbsp;ms of delay — a bad trade against the
+      primary score for a hypothetical hazard, so we left it out deliberately.</li>
+  </ul>
+
+</div>
+</body>
+</html>
